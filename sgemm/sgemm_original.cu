@@ -26,8 +26,7 @@ template <
     const int BLOCK_SIZE_K,  // width of block of A that each thread block load into shared memory
     const int BLOCK_SIZE_N,  // width of block of C that each thread block calculate
     const int THREAD_SIZE_Y, // height of block of C that each thread calculate
-    const int THREAD_SIZE_X,  // width of block of C that each thread calculate
-    const bool ENABLE_DOUBLE_BUFFER // whether enable double buffering or not
+    const int THREAD_SIZE_X  // width of block of C that each thread calculate
     > 
 __global__ void Sgemm( 
     float * __restrict__ A, float * __restrict__ B, float * __restrict__ C, 
@@ -48,17 +47,27 @@ __global__ void Sgemm(
     // thread id in cur Block
     const int tid = ty * THREAD_X_PER_BLOCK + tx;
 
-    // shared memory
+    // allocate double buffer shared memory
+    // 如果GPU的shared memory不够大，需要减小block size
     __shared__ float As[2][BLOCK_SIZE_K][BLOCK_SIZE_M];
     __shared__ float Bs[2][BLOCK_SIZE_K][BLOCK_SIZE_N];
-    // registers for C
+
+    // move the pointers A, B to the start of the current block,
+    // making it easier to start counting from 0.
+    A = &A[(BLOCK_SIZE_M * by)* K];
+    B = &B[BLOCK_SIZE_N * bx];
+
+    // registers for sub C
     float accum[THREAD_SIZE_Y][THREAD_SIZE_X] = {0};
-    // registers for A and B
+    // registers for sub A and B
     float frag_a[2][THREAD_SIZE_Y];
     float frag_b[2][THREAD_SIZE_X];
-    // registers load global memory
+    
     const int ldg_num_a = BLOCK_SIZE_M * BLOCK_SIZE_K / (THREAD_NUM_PER_BLOCK * 4);
     const int ldg_num_b = BLOCK_SIZE_K * BLOCK_SIZE_N / (THREAD_NUM_PER_BLOCK * 4);
+
+    // registers for load global memory
+    // 申请4倍于ldg_num_a的寄存器，用于以float4为单位读取global memory
     float ldg_a_reg[4*ldg_num_a];
     float ldg_b_reg[4*ldg_num_b];
 
@@ -77,14 +86,12 @@ __global__ void Sgemm(
     const int A_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / A_TILE_THREAD_PER_ROW;
     const int B_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / B_TILE_THREAD_PER_ROW;
 
-    A = &A[(BLOCK_SIZE_M * by)* K];
-    B = &B[BLOCK_SIZE_N * bx];
-
-    //transfer first tile from global mem to shared mem
+    // transfer first tile from global mem to shared mem
     // load A from global memory to shared memory
     #pragma unroll
     for ( int i = 0 ; i < BLOCK_SIZE_M ; i += A_TILE_ROW_STRIDE) {
         int ldg_index = i / A_TILE_ROW_STRIDE * 4;
+        // 矩阵A是行主序，而计算时是按列读取，所以先按行读取到register，再按列写入shared memory
         FETCH_FLOAT4(ldg_a_reg[ldg_index]) = FETCH_FLOAT4(A[OFFSET(
             A_TILE_ROW_START + i, // row
             A_TILE_COL, // col
@@ -102,7 +109,9 @@ __global__ void Sgemm(
                 B_TILE_COL, // col
                 N )]);
     }
+
     __syncthreads();
+
     // load A from shared memory to register
     #pragma unroll
     for (int thread_y = 0; thread_y < THREAD_SIZE_Y; thread_y += 4) {
@@ -116,6 +125,7 @@ __global__ void Sgemm(
 
     int write_stage_idx = 1;
     int tile_idx = 0;
+    // 循环计算每个tile
     do{
         tile_idx += BLOCK_SIZE_K;
         // load next tile from global mem
@@ -163,7 +173,9 @@ __global__ void Sgemm(
             }
         }
 
+        // 先做上面的计算步骤再读ldg_a/b_reg，减小空泡
         if(tile_idx < K){
+            // load A from global memory to shared memory (through register)
             #pragma unroll
             for ( int i = 0 ; i < BLOCK_SIZE_M ; i += A_TILE_ROW_STRIDE) {
                 int ldg_index = i / A_TILE_ROW_STRIDE * 4;
@@ -172,7 +184,7 @@ __global__ void Sgemm(
                 As[write_stage_idx][A_TILE_COL+2][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+2];
                 As[write_stage_idx][A_TILE_COL+3][A_TILE_ROW_START + i]=ldg_a_reg[ldg_index+3];
             }
-            // load B from global memory to shared memory
+            // load B from global memory to shared memory (through register)
             #pragma unroll
             for ( int i = 0 ; i < BLOCK_SIZE_K; i += B_TILE_ROW_STRIDE) {
                 int ldg_index = i / B_TILE_ROW_STRIDE * 4;
@@ -184,6 +196,7 @@ __global__ void Sgemm(
             write_stage_idx ^= 1;
         }
 
+        // 首次的读取必须在for loop之后，否则会造成数据覆盖
         // load first tile from shared mem to register of next iter
         // load A from shared memory to register
         #pragma unroll
@@ -195,6 +208,7 @@ __global__ void Sgemm(
         for (int thread_x = 0; thread_x < THREAD_SIZE_X; thread_x += 4) {
             FETCH_FLOAT4(frag_b[0][thread_x]) = FETCH_FLOAT4(Bs[load_stage_idx^1][0][THREAD_SIZE_X * tx + thread_x]);
         }
+
         //compute last tile mma THREAD_SIZE_X x THREAD_SIZE_Y
         #pragma unroll
         for (int thread_y = 0; thread_y < THREAD_SIZE_Y; ++thread_y) {
@@ -220,7 +234,7 @@ __global__ void Sgemm(
 
 int main(int argc, char** argv) {
     if (argc != 4) {
-        printf("usage: ./main [M] [K] [N]\n");
+        printf("usage must be: ./main [M] [K] [N]\n");
         exit(0);
     }
     size_t M = atoi(argv[1]);
@@ -255,7 +269,6 @@ int main(int argc, char** argv) {
     const int BLOCK_SIZE_N = 128;
     const int THREAD_SIZE_X = 8;
     const int THREAD_SIZE_Y = 8;
-    const bool ENABLE_DOUBLE_BUFFER = false;
 
     // generate A
     for( int i = 0; i < M * K; i++ ){
@@ -281,7 +294,7 @@ int main(int argc, char** argv) {
     for (int run = 0 ; run < nIter; run ++ ) {
         dim3 dimBlock(BLOCK_SIZE_N / THREAD_SIZE_X, BLOCK_SIZE_M / THREAD_SIZE_Y);
         dim3 dimGrid(N / BLOCK_SIZE_N, M / BLOCK_SIZE_M);
-        Sgemm<BLOCK_SIZE_M, BLOCK_SIZE_K, BLOCK_SIZE_N, THREAD_SIZE_Y, THREAD_SIZE_X, ENABLE_DOUBLE_BUFFER> 
+        Sgemm<BLOCK_SIZE_M, BLOCK_SIZE_K, BLOCK_SIZE_N, THREAD_SIZE_Y, THREAD_SIZE_X> 
         <<< dimGrid, dimBlock >>>(d_A, d_B, d_C, M, N, K);
     }
     checkCudaErrors(cudaEventRecord(stop));
@@ -356,4 +369,3 @@ int main(int argc, char** argv) {
     free(h_C);
     free(h_C1);
 }
-
