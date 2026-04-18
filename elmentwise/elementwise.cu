@@ -1,15 +1,12 @@
-#include <bits/stdc++.h>
-#include <cuda.h>
-#include "cuda_runtime.h"
-#include "device_launch_parameters.h"
-#include <time.h>
-#include <sys/time.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <random>
+#include <vector>
+
+#include "../utils/utils.hpp"
 
 #define THREAD_PER_BLOCK 256
-
-// transfer vector
-#define FETCH_FLOAT2(pointer) (reinterpret_cast<float2*>(&(pointer))[0])
-#define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 
 // Simplest version of elementwise add
 __global__ void vec4_ADD_kernel(
@@ -33,111 +30,171 @@ __device__ __forceinline__ float sigmoid_f(float x) {
 }
 
 template<
-    const int BLOCK_M,  // height of block of output that each thread block calculate
-    const int BLOCK_N,  // width of block of output that each thread block calculate
-    const int BLOCK_K,  // width of block of input that each thread block load into shared memory
-    const int THREAD_TILE_N //  length of each thread calculate
+    const int BLOCK_SIZE_M,  // height of block of output that each thread block calculate
+    const int BLOCK_SIZE_N,  // width of block of output that each thread block calculate
+    const int BLOCK_SIZE_K,  // width of block of input that each thread block load into shared memory
+    const int THREAD_TILE_Y, //  height of each thread calculate
+    const int THREAD_TILE_X //  width of each thread calculate
     > 
 __global__ void SwiGeLU_kernel(
     const float* __restrict__ input,      // [M, K]
     const float* __restrict__ weight_1,   // [K, N]
     const float* __restrict__ weight_2,   // [K, N]
-    const float* __restrict__ bias_1,     // [M, N]
-    const float* __restrict__ bias_2,     // [M, N]
+    const float* __restrict__ bias_1,     // [N]
+    const float* __restrict__ bias_2,     // [N]
     float* __restrict__ output,           // [M, N]
     const int M, const int K, const int N
     ) {
+    static_assert(BLOCK_SIZE_M % THREAD_TILE_Y == 0, "BLOCK_SIZE_M must be divisible by THREAD_TILE_Y");
+    static_assert(BLOCK_SIZE_N % THREAD_TILE_X == 0, "BLOCK_SIZE_N must be divisible by THREAD_TILE_X");
+    static_assert(BLOCK_SIZE_K % 4 == 0,             "BLOCK_SIZE_K must be multiple of 4");
+    static_assert(BLOCK_SIZE_N % 4 == 0,             "BLOCK_SIZE_N must be multiple of 4");
+    static_assert(THREAD_TILE_Y % 4 == 0,            "THREAD_TILE_Y must be multiple of 4");
+    static_assert(THREAD_TILE_X % 4 == 0,            "THREAD_TILE_X must be multiple of 4");
+
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
-    const int tid = ty * blockDim.x + tx;
-    const int THREADS_PER_BLOCK = blockDim.x * blockDim.y;
 
-    const int row = blockIdx.y * BLOCK_M + ty;
-    const int col_base = blockIdx.x * BLOCK_N + tx * THREAD_TILE_N;
+    const int THREAD_X_PER_BLOCK   = BLOCK_SIZE_N / THREAD_TILE_X;
+    const int THREAD_Y_PER_BLOCK   = BLOCK_SIZE_M / THREAD_TILE_Y;
+    const int THREAD_NUM_PER_BLOCK = THREAD_X_PER_BLOCK * THREAD_Y_PER_BLOCK;
 
-    __shared__ float tile_a[BLOCK_M][BLOCK_K];
-    __shared__ float tile_b1[BLOCK_K][BLOCK_N];
-    __shared__ float tile_b2[BLOCK_K][BLOCK_N];
+    const int tid = ty * THREAD_X_PER_BLOCK + tx;
 
-    float acc_1[THREAD_TILE_N] = {0.0f};
-    float acc_2[THREAD_TILE_N] = {0.0f};
-
-    for (int tile_k = 0; tile_k < K; tile_k += BLOCK_K) {
-        for (int load_idx = tid; load_idx < BLOCK_M * BLOCK_K; load_idx += THREADS_PER_BLOCK) {
-            const int r = load_idx / BLOCK_K;
-            const int c = load_idx % BLOCK_K;
-            const int g_row = blockIdx.y * BLOCK_M + r;
-            const int g_col = tile_k + c;
-            // reverse
-            tile_a[r][c] = (g_row < M && g_col < K) ? input[g_row * K + g_col] : 0.0f;
-        }
-
-        for (int load_idx = tid; load_idx < BLOCK_K * BLOCK_N; load_idx += THREADS_PER_BLOCK) {
-            const int r = load_idx / BLOCK_N;
-            const int c = load_idx % BLOCK_N;
-            const int g_row = tile_k + r;
-            const int g_col = blockIdx.x * BLOCK_N + c;
-            tile_b1[r][c] = (g_row < K && g_col < N) ? weight_1[g_row * N + g_col] : 0.0f;
-            tile_b2[r][c] = (g_row < K && g_col < N) ? weight_2[g_row * N + g_col] : 0.0f;
-        }
-        __syncthreads();
-
-        if (row < M) {
-            #pragma unroll
-            for (int k_inner = 0; k_inner < BLOCK_K; ++k_inner) {
-                const float a_frag = tile_a[ty][k_inner];
-                #pragma unroll
-                for (int tn = 0; tn < THREAD_TILE_N; ++tn) {
-                    const int col = tx * THREAD_TILE_N + tn;
-                    acc_1[tn] += a_frag * tile_b1[k_inner][col];
-                    acc_2[tn] += a_frag * tile_b2[k_inner][col];
-                }
-            }
-        }
-        __syncthreads();
+    // shared memory for bias
+    __shared__ float sb1[BLOCK_SIZE_N];
+    __shared__ float sb2[BLOCK_SIZE_N];
+    // load bias from global memory to shared memory
+    if (tid < BLOCK_SIZE_N / 4) {
+        FETCH_FLOAT4(sb1[tid * 4]) = LOAD_FLOAT4(bias_1[blockIdx.x * BLOCK_SIZE_N + tid * 4]);
+        FETCH_FLOAT4(sb2[tid * 4]) = LOAD_FLOAT4(bias_2[blockIdx.x * BLOCK_SIZE_N + tid * 4]);
     }
 
-    if (row < M) {
-        // Prefer float4 vectorized load/store on contiguous columns.
+    // allocate shared memory
+    __shared__ float sx[BLOCK_SIZE_K][BLOCK_SIZE_M];
+    __shared__ float sw1[BLOCK_SIZE_K][BLOCK_SIZE_N];
+    __shared__ float sw2[BLOCK_SIZE_K][BLOCK_SIZE_N];
+
+    // set the pointer to the starting position of the current block
+    input = &input[(BLOCK_SIZE_M * blockIdx.y)* K];
+    weight_1 = &weight_1[BLOCK_SIZE_N * blockIdx.x];
+    weight_2 = &weight_2[BLOCK_SIZE_N * blockIdx.x];
+
+    // registers for sub accumulaton
+    float acc_x_1[THREAD_TILE_Y][THREAD_TILE_X] = {};
+    float acc_x_2[THREAD_TILE_Y][THREAD_TILE_X] = {};
+
+    // registers for sub input and weights
+    float frag_x[THREAD_TILE_Y];
+    float frag_w1[THREAD_TILE_X];
+    float frag_w2[THREAD_TILE_X];
+
+    // the number of threads that need to load one row of a block
+    const int A_TILE_THREAD_PER_ROW = BLOCK_SIZE_K / 4;
+    const int B_TILE_THREAD_PER_ROW = BLOCK_SIZE_N / 4;
+
+    // row number and col number that needs to be loaded by this thread
+    const int A_TILE_ROW_START = tid / A_TILE_THREAD_PER_ROW;
+    const int B_TILE_ROW_START = tid / B_TILE_THREAD_PER_ROW;
+
+    const int A_TILE_COL = tid % A_TILE_THREAD_PER_ROW * 4;
+    const int B_TILE_COL = tid % B_TILE_THREAD_PER_ROW * 4;
+
+    // row stride that thread uses to load multiple rows of a tile
+    const int A_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / A_TILE_THREAD_PER_ROW;
+    const int B_TILE_ROW_STRIDE = THREAD_NUM_PER_BLOCK / B_TILE_THREAD_PER_ROW;
+
+    int tile_idx = 0;
+
+    // registers for load global memory
+    float4 ldg_x_reg;
+
+    do{
+        // load input and weight from global memory to shared memory (through register)
         #pragma unroll
-        for (int tn = 0; tn < THREAD_TILE_N; tn += 4) {
-            const int col = col_base + tn;
-            if (col + 1 < N && (col & 1) == 0) {
-                const int linear_idx = row * N + col;
+        for ( int i = 0 ; i < BLOCK_SIZE_M ; i += A_TILE_ROW_STRIDE) {
+            ldg_x_reg = LOAD_FLOAT4(input[OFFSET(
+                A_TILE_ROW_START + i, // row
+                A_TILE_COL + tile_idx, // col
+                K )]);
 
-                const float4 bias1 = FETCH_FLOAT4(bias_1 + linear_idx);
-                const float4 bias2 = FETCH_FLOAT4(bias_2 + linear_idx);
+            sx[A_TILE_COL  ][A_TILE_ROW_START + i]=ldg_x_reg.x;
+            sx[A_TILE_COL+1][A_TILE_ROW_START + i]=ldg_x_reg.y;
+            sx[A_TILE_COL+2][A_TILE_ROW_START + i]=ldg_x_reg.z;
+            sx[A_TILE_COL+3][A_TILE_ROW_START + i]=ldg_x_reg.w;
+        }
+        #pragma unroll
+        for ( int i = 0 ; i < BLOCK_SIZE_K; i += B_TILE_ROW_STRIDE) {
+            FETCH_FLOAT4(sw1[B_TILE_ROW_START + i][B_TILE_COL]) = LOAD_FLOAT4(weight_1[OFFSET(
+                B_TILE_ROW_START + i + tile_idx, // row
+                B_TILE_COL, // col
+                N )]);
+            FETCH_FLOAT4(sw2[B_TILE_ROW_START + i][B_TILE_COL]) = LOAD_FLOAT4(weight_2[OFFSET(
+                B_TILE_ROW_START + i + tile_idx, // row
+                B_TILE_COL, // col
+                N )]);
+        }
 
-                float4 out4;
-                const float a0 = acc_1[tn] + bias1.x;
-                const float b0 = acc_2[tn] + bias2.x;
-                out2.x = a0 * sigmoid_f(a0) * b0;
+        __syncthreads();
 
-                const float a1 = acc_1[tn + 1] + bias1.y;
-                const float b1 = acc_2[tn + 1] + bias2.y;
-                out2.y = a1 * sigmoid_f(a1) * b1;
+        #pragma unroll
+        for(int k = 0; k < BLOCK_SIZE_K; ++k){
+            // load next tile from shared mem to register
+            #pragma unroll
+            for(int thread_y = 0; thread_y < THREAD_TILE_Y; thread_y += 4) {
+                FETCH_FLOAT4(frag_x[thread_y]) = FETCH_FLOAT4(sx[k][THREAD_TILE_Y * ty + thread_y]);
+            }
+            #pragma unroll
+            for(int thread_x = 0; thread_x < THREAD_TILE_X; thread_x += 4) {
+                FETCH_FLOAT4(frag_w1[thread_x]) = FETCH_FLOAT4(sw1[k][THREAD_TILE_X * tx + thread_x]);
+                FETCH_FLOAT4(frag_w2[thread_x]) = FETCH_FLOAT4(sw2[k][THREAD_TILE_X * tx + thread_x]);
+            }
 
-                const float a2 = acc_1[tn + 2] + bias1.z;
-                const float b2 = acc_2[tn + 2] + bias2.z;
-                out2.z = a2 * sigmoid_f(a2) * b2;
-                
-                const float a3 = acc_1[tn + 3] + bias1.w;
-                const float b3 = acc_2[tn + 3] + bias2.w;
-                out2.w = a3 * sigmoid_f(a3) * b3;
-
-                FETCH_FLOAT4(output + linear_idx)x = out4;
-            } else if (col < N) {
-                const int linear_idx = row * N + col;
-                const float a = acc_1[tn] + bias_1[linear_idx];
-                const float b = acc_2[tn] + bias_2[linear_idx];
-                output[linear_idx] = a * sigmoid_f(a) * b;
-                if (tn + 1 < THREAD_TILE_N && (col + 1) < N) {
-                    const int linear_idx_1 = linear_idx + 1;
-                    const float a1 = acc_1[tn + 1] + bias_1[linear_idx_1];
-                    const float b1 = acc_2[tn + 1] + bias_2[linear_idx_1];
-                    output[linear_idx_1] = a1 * sigmoid_f(a1) * b1;
+            // compute input x weight1 and weight2
+            #pragma unroll
+            for (int thread_y = 0; thread_y < THREAD_TILE_Y; ++thread_y) {
+                #pragma unroll
+                for (int thread_x = 0; thread_x < THREAD_TILE_X; ++thread_x) {
+                    acc_x_1[thread_y][thread_x] += frag_x[thread_y] * frag_w1[thread_x];
+                    acc_x_2[thread_y][thread_x] += frag_x[thread_y] * frag_w2[thread_x];
                 }
             }
+    
+        }
+
+        __syncthreads();
+        tile_idx += BLOCK_SIZE_K;
+    
+    }while(tile_idx < K);
+
+    const int row_base = blockIdx.y * BLOCK_SIZE_M + ty * THREAD_TILE_Y;
+    const int col_base = blockIdx.x * BLOCK_SIZE_N + tx * THREAD_TILE_X;
+
+    #pragma unroll
+    for (int y = 0; y < THREAD_TILE_Y; ++y) {
+        const int row = row_base + y;
+        #pragma unroll
+        for (int x = 0; x < THREAD_TILE_X; x += 4) {
+            const int col_in_block = tx * THREAD_TILE_X + x;   // [0, BLOCK_SIZE_N)
+            const int col          = col_base + x;
+            const int idx          = row * N + col;
+    
+            float4 b1 = FETCH_FLOAT4(sb1[col_in_block]);
+            float4 b2 = FETCH_FLOAT4(sb2[col_in_block]);
+            float4 prev = FETCH_FLOAT4(output[idx]);
+    
+            float a0 = acc_x_1[y][x  ] + b1.x, c0 = acc_x_2[y][x  ] + b2.x;
+            float a1 = acc_x_1[y][x+1] + b1.y, c1 = acc_x_2[y][x+1] + b2.y;
+            float a2 = acc_x_1[y][x+2] + b1.z, c2 = acc_x_2[y][x+2] + b2.z;
+            float a3 = acc_x_1[y][x+3] + b1.w, c3 = acc_x_2[y][x+3] + b2.w;
+    
+            float4 out;
+            out.x = prev.x + a0 * sigmoid_f(a0) * c0;
+            out.y = prev.y + a1 * sigmoid_f(a1) * c1;
+            out.z = prev.z + a2 * sigmoid_f(a2) * c2;
+            out.w = prev.w + a3 * sigmoid_f(a3) * c3;
+    
+            FETCH_FLOAT4(output[idx]) = out;
         }
     }
 }
@@ -150,47 +207,172 @@ bool check(float *out,float *res,int n){
     return true;
 }
 
-int main(){
-    const int N=32*1024*1024;
-    float *a=(float *)malloc(N*sizeof(float));
-    float *b=(float *)malloc(N*sizeof(float));
-    float *out=(float *)malloc(N*sizeof(float));
-    float *d_a;
-    float *d_b;
-    float *d_out;
-    cudaMalloc((void **)&d_a,N*sizeof(float));
-    cudaMalloc((void **)&d_b,N*sizeof(float));
-    cudaMalloc((void **)&d_out,N*sizeof(float));
-    float *res=(float *)malloc(N*sizeof(float));
-
-    for(int i=0;i<N;i++){
-        a[i]=1;
-        b[i]=i;
-        res[i]=a[i]+b[i];
-    }
-
-    cudaMemcpy(d_a,a,N*sizeof(float),cudaMemcpyHostToDevice);
-    cudaMemcpy(d_b,b,N*sizeof(float),cudaMemcpyHostToDevice);
-
-    dim3 Grid( N/THREAD_PER_BLOCK/4, 1);
-    dim3 Block( THREAD_PER_BLOCK, 1);
-
-    int iter = 2000;
-    for(int i=0; i<iter; i++){
-        vec4_ADD_kernel<<<Grid,Block>>>(d_a, d_b, d_out);
-    }
-
-    cudaMemcpy(out,d_out,N*sizeof(float),cudaMemcpyDeviceToHost);
-
-    if(check(out,res,N))printf("the ans is right\n");
-    else{
-        printf("the ans is wrong\n");
-        for(int i=0;i<N;i++){
-            printf("%lf ",out[i]);
+// ====================== CPU reference for SwiGeLU_kernel ======================
+// out[i, j] = init_out[i, j] + swish(x @ W1 + b1)[i, j] * (x @ W2 + b2)[i, j]
+//           swish(t) = t * sigmoid(t)
+static void swiglu_cpu_ref(
+    const float* x,        // [M, K]
+    const float* w1,       // [K, N]
+    const float* w2,       // [K, N]
+    const float* b1,       // [N]
+    const float* b2,       // [N]
+    const float* init_out, // [M, N]
+    float*       out,      // [M, N]
+    int M, int K, int N)
+{
+    for (int i = 0; i < M; ++i) {
+        for (int j = 0; j < N; ++j) {
+            double a = 0.0, c = 0.0;
+            for (int k = 0; k < K; ++k) {
+                a += static_cast<double>(x[i * K + k]) * static_cast<double>(w1[k * N + j]);
+                c += static_cast<double>(x[i * K + k]) * static_cast<double>(w2[k * N + j]);
+            }
+            a += static_cast<double>(b1[j]);
+            c += static_cast<double>(b2[j]);
+            const double sig = 1.0 / (1.0 + std::exp(-a));
+            const double swish = a * sig;
+            out[i * N + j] = static_cast<float>(static_cast<double>(init_out[i * N + j]) + swish * c);
         }
-        printf("\n");
+    }
+}
+
+static bool compare_result(const float* gpu, const float* ref, int n,
+                           float rtol = 1e-3f, float atol = 1e-4f,
+                           int max_print = 10) {
+    bool ok = true;
+    int printed = 0;
+    double max_abs_err = 0.0, max_rel_err = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const float g = gpu[i], r = ref[i];
+        const float abs_err = std::fabs(g - r);
+        const float rel_err = abs_err / std::max(std::fabs(r), 1e-20f);
+        if (abs_err > atol && rel_err > rtol) {
+            if (printed < max_print) {
+                std::printf("  mismatch at %d: gpu=%.6f ref=%.6f abs=%.3e rel=%.3e\n",
+                            i, g, r, abs_err, rel_err);
+                ++printed;
+            }
+            ok = false;
+        }
+        max_abs_err = std::max<double>(max_abs_err, abs_err);
+        max_rel_err = std::max<double>(max_rel_err, rel_err);
+    }
+    std::printf("  max_abs_err = %.3e, max_rel_err = %.3e\n", max_abs_err, max_rel_err);
+    return ok;
+}
+
+int main() {
+    constexpr int M = 2048;
+    constexpr int K = 512;
+    constexpr int N = 2048;
+
+    constexpr int BM = 128;
+    constexpr int BN = 128;
+    constexpr int BK = 8;
+    constexpr int TY = 8;
+    constexpr int TX = 8;
+
+    static_assert(M % BM == 0, "M must be divisible by BLOCK_SIZE_M");
+    static_assert(N % BN == 0, "N must be divisible by BLOCK_SIZE_N");
+    static_assert(K % BK == 0, "K must be divisible by BLOCK_SIZE_K");
+
+    const size_t sz_x  = static_cast<size_t>(M) * K;
+    const size_t sz_w  = static_cast<size_t>(K) * N;
+    const size_t sz_b  = static_cast<size_t>(N);
+    const size_t sz_o  = static_cast<size_t>(M) * N;
+
+    std::vector<float> h_x (sz_x);
+    std::vector<float> h_w1(sz_w);
+    std::vector<float> h_w2(sz_w);
+    std::vector<float> h_b1(sz_b);
+    std::vector<float> h_b2(sz_b);
+    std::vector<float> h_out_init(sz_o);
+    std::vector<float> h_out_gpu (sz_o);
+    std::vector<float> h_out_ref (sz_o);
+
+    // use small range random values to avoid exp overflow, and also convenient to compare
+    std::mt19937 rng(0xC0FFEE);
+    std::uniform_real_distribution<float> dist(-0.2f, 0.2f);
+    for (auto& v : h_x ) v = dist(rng);
+    for (auto& v : h_w1) v = dist(rng);
+    for (auto& v : h_w2) v = dist(rng);
+    for (auto& v : h_b1) v = dist(rng);
+    for (auto& v : h_b2) v = dist(rng);
+
+    // give output a non-zero initial value, to measure the accumulation semantic
+    for (auto& v : h_out_init) v = dist(rng);
+
+    float *d_x, *d_w1, *d_w2, *d_b1, *d_b2, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_x,   sz_x * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_w1,  sz_w * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_w2,  sz_w * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_b1,  sz_b * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_b2,  sz_b * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_out, sz_o * sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpy(d_x,  h_x.data(),        sz_x * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w1, h_w1.data(),       sz_w * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w2, h_w2.data(),       sz_w * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b1, h_b1.data(),       sz_b * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b2, h_b2.data(),       sz_b * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_out, h_out_init.data(), sz_o * sizeof(float), cudaMemcpyHostToDevice));
+
+    dim3 block(BN / TX, BM / TY);
+    dim3 grid (N / BN,  M / BM);
+
+    SwiGeLU_kernel<BM, BN, BK, TY, TX><<<grid, block>>>(
+        d_x, d_w1, d_w2, d_b1, d_b2, d_out, M, K, N);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(h_out_gpu.data(), d_out, sz_o * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // CPU reference
+    swiglu_cpu_ref(h_x.data(), h_w1.data(), h_w2.data(),
+                   h_b1.data(), h_b2.data(),
+                   h_out_init.data(), h_out_ref.data(),
+                   M, K, N);
+
+    std::printf("SwiGeLU correctness test: M=%d K=%d N=%d, block=(%d,%d,%d) thread_tile=(%d,%d)\n",
+                M, K, N, BM, BN, BK, TY, TX);
+    bool ok = compare_result(h_out_gpu.data(), h_out_ref.data(),
+                            static_cast<int>(sz_o),
+                            1e-3f, 1e-4f);
+    std::printf("Result: %s\n", ok ? "PASS" : "FAIL");
+
+    // simple timing (optional)
+    {
+        // 重置 output 初值，计时只反映 kernel 本身
+        CUDA_CHECK(cudaMemcpy(d_out, h_out_init.data(), sz_o * sizeof(float), cudaMemcpyHostToDevice));
+        cudaEvent_t s, e;
+        CUDA_CHECK(cudaEventCreate(&s));
+        CUDA_CHECK(cudaEventCreate(&e));
+        const int iters = 30;
+        CUDA_CHECK(cudaEventRecord(s));
+        for (int i = 0; i < iters; ++i) {
+            // 这里每次都累加到同一块 output 会越积越大，只为看性能，不看数值
+            SwiGeLU_kernel<BM, BN, BK, TY, TX><<<grid, block>>>(
+                d_x, d_w1, d_w2, d_b1, d_b2, d_out, M, K, N);
+        }
+        CUDA_CHECK(cudaEventRecord(e));
+        CUDA_CHECK(cudaEventSynchronize(e));
+        float ms = 0.f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
+        const double avg_ms = ms / iters;
+        // 两个 GEMM + SwiGLU elementwise 的 FLOPs
+        const double flops = 2.0 * 2.0 * M * N * K + 5.0 * M * N;
+        std::printf("avg kernel time: %.3f ms,  %.2f GFLOP/s\n",
+                    avg_ms, flops / (avg_ms * 1e-3) / 1e9);
+        cudaEventDestroy(s);
+        cudaEventDestroy(e);
     }
 
-    cudaFree(d_a);
+    cudaFree(d_x);
+    cudaFree(d_w1);
+    cudaFree(d_w2);
+    cudaFree(d_b1);
+    cudaFree(d_b2);
     cudaFree(d_out);
+
+    return ok ? 0 : 1;
 }
