@@ -1,6 +1,13 @@
 # The introduction of sgemm kernel
-食用方式: 带上参数直接执行，参数0 1 2分别是M K N，因为使用了float4向量读，三者必须是4的倍数
-为便于理解，kernel中有许多用于标识的常量
+矩阵乘法执行的是两个矩阵相乘并累加到第三个矩阵的操作，据此，我们首先分析一下GEMM的计算访存比
+以M * K, K * N两个矩阵相乘举例, 计算结果为M * N的矩阵, 其每个元素计算需要进行K次乘法, K-1次加法, 一共要算M * N个元素, 总的计算量便是 M * N * (K + K - 1) ,约等于2MNK
+计算中, 需要读矩阵 MK, KN, 需要写矩阵MN, 若每个元素以 4Bytes 的标准 float存储, 总访存便是 (M * K + K * N + M * N) * 4
+假设三个矩阵形状一样, 都是M, N, K均 = N, 这时的计算访存比为 2 * N^3 / 4 * (3N^2) = N / 6, 矩阵规模越大，计算量就越大，可以体现GEMM是计算密集型算子
+
+## 代码食用方式
+用nvcc编译, 以./xxx的形式带上参数执行, 参考指令:
+nvcc sgemm_original.cu -o sgemm_original -lcublas
+参数0 1 2分别是M K N，因为使用了float4向量读，三者必须是4的倍数
 
 ## Original Version
 Original是一个简略优化版本，包含了gemm常用优化思路的实现，包括: 循环展开, 使用shared memory, 矩阵分块计算, 数据预取
