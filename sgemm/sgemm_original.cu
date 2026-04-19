@@ -52,7 +52,7 @@ __global__ void Sgemm(
     __shared__ float As[2][BLOCK_SIZE_K][BLOCK_SIZE_M];
     __shared__ float Bs[2][BLOCK_SIZE_K][BLOCK_SIZE_N];
 
-    // move the pointers A, B to the start of the current block,
+    // move the pointers A, B to the start of the current block
     // making it easier to start counting from 0.
     A = &A[(BLOCK_SIZE_M * by)* K];
     B = &B[BLOCK_SIZE_N * bx];
