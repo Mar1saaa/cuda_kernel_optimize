@@ -6,8 +6,6 @@
 
 #include "../utils/utils.hpp"
 
-#define THREAD_PER_BLOCK 256
-
 // Simplest version of elementwise add
 __global__ void vec4_ADD_kernel(
     float* a, float* b, float* c
